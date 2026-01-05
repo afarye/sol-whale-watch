@@ -3229,6 +3229,7 @@ dependencies = [
  "futures",
  "solana-client",
  "solana-sdk",
+ "solana-transaction-status",
  "tokio",
 ]
 

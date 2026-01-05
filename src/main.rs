@@ -1,111 +1,115 @@
 use dotenv::dotenv;
-use solana_client::nonblocking::pubsub_client::PubsubClient; // 引入 PubSub 客户端
-use solana_client::rpc_config::RpcTransactionLogsConfig;
-use solana_client::rpc_config::RpcTransactionLogsFilter;
-use solana_client::nonblocking::rpc_client::RpcClient; // nonblocking：这是异步版本，与同步版本solana_client::rpc_client区分
+use solana_client::nonblocking::pubsub_client::PubsubClient;
+use solana_client::rpc_config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use tokio::sync::mpsc;
 use solana_sdk::commitment_config::CommitmentConfig;
-use futures::StreamExt; // 让我们可以用 .next() 遍历数据流
+use futures::StreamExt;
+use solana_transaction_status::UiTransactionEncoding;
+use solana_sdk::signature::Signature; // 需要用来解析签名字符串
 use std::env;
+use std::str::FromStr; // 需要用来把 String 转 Signature
+use std::sync::Arc; // <--- 引入 Arc 实现共享
 
-// #[tokio::main] 是一个过程宏，它把 async fn main() 转换成真正启动 Tokio 运行时的代码
-/*
-展开后的实际代码大致如下：
-fn main() {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            // 你的async main代码在这里
-        })
-}
-*/
 #[tokio::main]
-/*
- */
 async fn main() -> anyhow::Result<()> {
-    // 加载 .env 文件
     dotenv().ok();
-    /*
-    dotenv()：函数调用，读取.env文件
-    .ok()：将Result<T, E>转换为Option<T>，忽略错误
-    如果.env文件不存在也不报错，继续执行
-    */
-    println!("🚀 启动 Solana 巨鲸监控者 (WebSocket 版)...");
+    println!("🚀 启动 Solana 巨鲸监控者 (并发架构版)...");
 
-    // 读取环境变量 WS_URL
-    let ws_url = env::var("WS_URL").expect("请在 .env 中设置 WS_URL");
-    println!("📡 正在连接 WebSocket: {}", ws_url);
+    let ws_url = env::var("WS_URL").expect("WS_URL 未设置");
+    let rpc_url = env::var("RPC_URL").expect("RPC_URL 未设置");
 
+    // 1. 创建管道
+    let (tx, mut rx) = mpsc::channel::<String>(100);
 
-    // 创建 PubSub 客户端
-    // PubSubClient::new 会返回一个 Result，我们需要解包
+    // 2. 启动后台消费者 (调度中心)
+    tokio::spawn(async move {
+        println!("👨‍🔧 后台调度中心已就位...");
+        
+        // 创建 RPC 客户端并用 Arc 包裹
+        let rpc_client = RpcClient::new(rpc_url);
+        let client_arc = Arc::new(rpc_client);
+
+        while let Some(signature) = rx.recv().await {
+            // 克隆 Arc 指针 (成本极低)
+            let client_ref = client_arc.clone();
+            
+            // 🔥 关键：为每一笔交易开启一个独立的轻量级线程
+            // 这样前一笔交易卡住不会影响下一笔
+            tokio::spawn(async move {
+                if let Err(e) = process_transaction(client_ref, signature).await {
+                    // 打印错误以便调试 (如果是 'not found' 可以忽略，但现在先看看)
+                    // eprintln!("❌ 处理失败: {}", e);
+                }
+            });
+        }
+    });
+
+    // 3. 生产者：WebSocket 监听
+    println!("📡 连接 WebSocket...");
     let pubsub_client = PubsubClient::new(&ws_url).await?;
-    println!("✅ WebSocket 连接成功!");
-
-    // 定义订阅过滤器
-    // 我们监听 "System Program" (11111111111111111111111111111111)
-    // 这意味着任何涉及 SOL 转账或系统操作的交易都会被捕获
-    let filter = RpcTransactionLogsFilter::Mentions(vec![
-        "11111111111111111111111111111111".to_string()
-    ]);
-
-
-        let config = RpcTransactionLogsConfig {
-        // processed 级别最快，可能有极低概率回滚，但适合监控
-        commitment: Some(CommitmentConfig::processed()), 
+    // 监听 System Program (SOL 转账)
+    let filter = RpcTransactionLogsFilter::Mentions(vec!["11111111111111111111111111111111".to_string()]);
+    let config = RpcTransactionLogsConfig {
+        commitment: Some(CommitmentConfig::processed()),
     };
+    let (mut stream, _unsub) = pubsub_client.logs_subscribe(filter, config).await?;
 
-    println!("🎧 开始监听 System Program 的日志流...");
+    println!("🎧 监听中... (阈值: > 0.1 SOL)");
 
-    // 订阅日志 (logs_subscribe)
-    // 这会返回两个东西：
-    // - stream: 一个源源不断吐出数据的流
-    // - _unsubscribe: 取消订阅的句柄（这里我们暂不使用，让它一直跑）
-    let (mut stream, _unsubscribe) = pubsub_client
-        .logs_subscribe(filter, config)
-        .await?;
-
-    // 处理数据流 (无限循环)
-    // stream.next().await 会在这里“等待”，直到 Solana 推送一条新数据过来
     while let Some(response) = stream.next().await {
-        // response.value 包含了日志的具体内容
         let logs = response.value;
 
-        // 打印交易签名 (Signature)
-        // 这是每一笔交易的唯一身份证
-        // 只有当 logs.err 为 None（表示交易成功），并且 日志数量（logs.logs.len()）大于 5 行时，才打印出来
-        if logs.err.is_some() || logs.logs.len() <= 5 {
+        // 🛠️ 修复 1：不要过滤 logs.len() <= 5
+        // 只过滤掉失败的交易 (err.is_some())
+        if logs.err.is_some() {
             continue;
         }
 
-        println!("🔥 捕获新交易: https://solscan.io/tx/{}", logs.signature);
-        
-        // 打印一点点日志看看 (只打印前3行，防止刷屏)
-        for log in logs.logs.iter().take(3) {
-            println!("   📝 {}", log);
+        if let Err(_) = tx.send(logs.signature.clone()).await {
+            println!("后台已关闭");
+            break;
         }
-        println!("---------------------------------------------------");
     }
 
     Ok(())
 }
-/*
-主线程
-   ↓
-[tokio::main] 创建运行时
-   ↓
-运行时.spawn(主Future)
-   ↓
-主Future.poll()
-   ↓
-遇到.await → 返回Pending
-   ↓
-运行时检查其他就绪的任务
-   ↓
-IO完成 → 唤醒对应任务
-   ↓
-继续执行.await之后的代码
-*/
 
+// 接收 Arc<RpcClient>
+async fn process_transaction(client: Arc<RpcClient>, signature_str: String) -> anyhow::Result<()> {
+    let signature = Signature::from_str(&signature_str)?;
 
+    // 使用 JsonParsed 格式
+    let tx_detail = client.get_transaction(&signature, UiTransactionEncoding::JsonParsed).await;
+
+    match tx_detail {
+        Ok(tx) => {
+            if let Some(meta) = tx.transaction.meta {
+                // 确保数据完整
+                if meta.pre_balances.len() == 0 || meta.post_balances.len() == 0 {
+                    return Ok(());
+                }
+
+                let pre_bal = meta.pre_balances[0];
+                let post_bal = meta.post_balances[0];
+
+                let diff_lamports = (pre_bal as i64 - post_bal as i64).abs();
+                let sol_amount = diff_lamports as f64 / 1_000_000_000.0;
+
+                // 阈值测试：0.1 SOL
+                if sol_amount > 0.1 {
+                    println!("🐋 捕获! https://solscan.io/tx/{}", signature_str);
+                    println!("   💰 {:.4} SOL (Account0 变动)", sol_amount);
+                    println!("-------------------------------------------");
+                }
+            }
+        }
+        Err(e) => {
+            // 如果是 "Transaction X not found"，说明 RPC 还没同步完这笔刚发生的交易
+            // 在生产环境中，我们通常会在这里 sleep 500ms 然后重试一次
+            // 这里为了简单先忽略
+            // eprintln!("RPC 查询过早: {}", e);
+        }
+    }
+    Ok(())
+}

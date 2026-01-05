@@ -19,3 +19,6 @@ anyhow = "1.0"
 
 # 5. 异步编程的工具库
 futures = "0.3"
+
+# 6. 交易状态库
+solana-transaction-status = "1.18"
