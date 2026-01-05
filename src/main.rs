@@ -1,7 +1,10 @@
 use dotenv::dotenv;
-use solana_client::nonblocking::rpc_client::RpcClient; 
-// nonblocking：这是异步版本，与同步版本solana_client::rpc_client区分
+use solana_client::nonblocking::pubsub_client::PubsubClient; // 引入 PubSub 客户端
+use solana_client::rpc_config::RpcTransactionLogsConfig;
+use solana_client::rpc_config::RpcTransactionLogsFilter;
+use solana_client::nonblocking::rpc_client::RpcClient; // nonblocking：这是异步版本，与同步版本solana_client::rpc_client区分
 use solana_sdk::commitment_config::CommitmentConfig;
+use futures::StreamExt; // 让我们可以用 .next() 遍历数据流
 use std::env;
 
 // #[tokio::main] 是一个过程宏，它把 async fn main() 转换成真正启动 Tokio 运行时的代码
@@ -21,79 +24,70 @@ fn main() {
 /*
  */
 async fn main() -> anyhow::Result<()> {
-    // 1. 加载 .env 文件 (虽然现在还没用到 API Key，先养成习惯)
+    // 加载 .env 文件
     dotenv().ok();
     /*
     dotenv()：函数调用，读取.env文件
     .ok()：将Result<T, E>转换为Option<T>，忽略错误
     如果.env文件不存在也不报错，继续执行
     */
-    println!("🚀 正在启动 Solana 巨鲸监控者...");
+    println!("🚀 启动 Solana 巨鲸监控者 (WebSocket 版)...");
 
-    // 2. 定义 RPC 节点地址
-    // mainnet-beta 是 Solana 的主网
-    // 注意：公共节点有速率限制，生产环境通常用 Helius/QuickNode/Alchemy
-    let rpc_url = env::var("RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
-    /*
-    env::var()：获取环境变量，返回Result<String, env::VarError>
-    .unwrap_or_else(|_| ...)：
-    如果Result是Ok，提取值
-    如果是Err，执行闭包|_| ...
-    |_|是闭包参数，_表示忽略错误值
-    .to_string()：将字符串字面量&str转换为String（堆分配）
-    */
-    // 3. 创建异步 RPC 客户端
-    // CommitmentConfig::confirmed() 表示我们认为“确认中”的状态就足够了，不用等完全 finalized
-    let client = RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed());
-    /*
-    ::new_with_commitment：关联函数（类似Java的静态方法）
-    CommitmentConfig::confirmed()：
-    confirmed表示交易已被超半数节点确认
-    还有processed（刚收到）、finalized（不可逆转）
-    */
-    println!("📡 正在连接到 Solana 主网: {}", rpc_url);
+    // 读取环境变量 WS_URL
+    let ws_url = env::var("WS_URL").expect("请在 .env 中设置 WS_URL");
+    println!("📡 正在连接 WebSocket: {}", ws_url);
 
-    // 4. 发起异步请求
-    // 这里的 .await 是关键！
-    // Java: client.getVersion() 会卡住线程等待网络返回
-    // Rust: client.get_version().await 会让出当前线程去干别的事，等网络回包了再回来继续
-    let version = client.get_version().await?; 
-    /*
-    .await：异步等待的关键操作符
-    非阻塞：当前async函数会暂停，让出线程控制权，线程可以去执行其他任务
-    */
-    let block_height = client.get_block_height().await?;
 
-    println!("✅ 连接成功!");
-    println!("   Solana 版本: {}", version.solana_core);
-    println!("   当前区块高度: {}", block_height);
-    
-    // 5. 模拟一个简单的并发任务 (可选演示)
-    // 只要为了让你感受一下 tokio::spawn
-    let handle = tokio::spawn(async {
-        println!("   [后台任务] 我是并发执行的小任务，我正在睡觉...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        println!("   [后台任务] 我醒了！");
-        "任务完成"
-    });
-    /*
-    tokio::spawn：创建新的异步任务
-    立即返回JoinHandle<T>，不等待任务完成
-    任务会被调度到Tokio运行时执行
-    async { ... }：异步块，创建一个匿名异步函数
-    tokio::time::sleep：异步睡眠，不阻塞线程
-    对比标准库的std::thread::sleep会阻塞整个线程 
-    tokio::time::Duration::from_secs(2)：创建一个Duration对象，表示2秒
-    */
+    // 创建 PubSub 客户端
+    // PubSubClient::new 会返回一个 Result，我们需要解包
+    let pubsub_client = PubsubClient::new(&ws_url).await?;
+    println!("✅ WebSocket 连接成功!");
 
-    // 等待后台任务完成
-    let result = handle.await?;
-    println!("   [主线程] 后台任务返回: {}", result);
-    /*
-    handle.await：等待任务完成，返回Result<T, JoinError>
-    如果任务正常结束：Ok(T)
-    如果任务panic：Err(JoinError)
-    */
+    // 定义订阅过滤器
+    // 我们监听 "System Program" (11111111111111111111111111111111)
+    // 这意味着任何涉及 SOL 转账或系统操作的交易都会被捕获
+    let filter = RpcTransactionLogsFilter::Mentions(vec![
+        "11111111111111111111111111111111".to_string()
+    ]);
+
+
+        let config = RpcTransactionLogsConfig {
+        // processed 级别最快，可能有极低概率回滚，但适合监控
+        commitment: Some(CommitmentConfig::processed()), 
+    };
+
+    println!("🎧 开始监听 System Program 的日志流...");
+
+    // 订阅日志 (logs_subscribe)
+    // 这会返回两个东西：
+    // - stream: 一个源源不断吐出数据的流
+    // - _unsubscribe: 取消订阅的句柄（这里我们暂不使用，让它一直跑）
+    let (mut stream, _unsubscribe) = pubsub_client
+        .logs_subscribe(filter, config)
+        .await?;
+
+    // 处理数据流 (无限循环)
+    // stream.next().await 会在这里“等待”，直到 Solana 推送一条新数据过来
+    while let Some(response) = stream.next().await {
+        // response.value 包含了日志的具体内容
+        let logs = response.value;
+
+        // 打印交易签名 (Signature)
+        // 这是每一笔交易的唯一身份证
+        // 只有当 logs.err 为 None（表示交易成功），并且 日志数量（logs.logs.len()）大于 5 行时，才打印出来
+        if logs.err.is_some() || logs.logs.len() <= 5 {
+            continue;
+        }
+
+        println!("🔥 捕获新交易: https://solscan.io/tx/{}", logs.signature);
+        
+        // 打印一点点日志看看 (只打印前3行，防止刷屏)
+        for log in logs.logs.iter().take(3) {
+            println!("   📝 {}", log);
+        }
+        println!("---------------------------------------------------");
+    }
+
     Ok(())
 }
 /*
