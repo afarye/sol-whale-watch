@@ -6,110 +6,139 @@ use tokio::sync::mpsc;
 use solana_sdk::commitment_config::CommitmentConfig;
 use futures::StreamExt;
 use solana_transaction_status::UiTransactionEncoding;
-use solana_sdk::signature::Signature; // 需要用来解析签名字符串
+use solana_sdk::signature::Signature;
 use std::env;
-use std::str::FromStr; // 需要用来把 String 转 Signature
-use std::sync::Arc; // <--- 引入 Arc 实现共享
+use std::str::FromStr;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-    println!("🚀 启动 Solana 巨鲸监控者 (并发架构版)...");
+    println!("🚀 启动 Solana 巨鲸监控者 (最终完整版)...");
 
     let ws_url = env::var("WS_URL").expect("WS_URL 未设置");
     let rpc_url = env::var("RPC_URL").expect("RPC_URL 未设置");
+    
+    // 检查 TG 配置，如果没有配置只会打印警告，不会崩溃
+    if env::var("TELEGRAM_TOKEN").is_err() {
+        println!("⚠️ 未检测到 TELEGRAM_TOKEN，报警功能将不可用");
+    }
 
-    // 1. 创建管道
     let (tx, mut rx) = mpsc::channel::<String>(100);
 
-    // 2. 启动后台消费者 (调度中心)
+    // --- 后台消费者 ---
     tokio::spawn(async move {
         println!("👨‍🔧 后台调度中心已就位...");
-        
-        // 创建 RPC 客户端并用 Arc 包裹
         let rpc_client = RpcClient::new(rpc_url);
         let client_arc = Arc::new(rpc_client);
 
         while let Some(signature) = rx.recv().await {
-            // 克隆 Arc 指针 (成本极低)
             let client_ref = client_arc.clone();
-            
-            // 🔥 关键：为每一笔交易开启一个独立的轻量级线程
-            // 这样前一笔交易卡住不会影响下一笔
             tokio::spawn(async move {
-                if let Err(e) = process_transaction(client_ref, signature).await {
-                    // 打印错误以便调试 (如果是 'not found' 可以忽略，但现在先看看)
-                    // eprintln!("❌ 处理失败: {}", e);
+                // 处理交易，并不再关心返回值，只负责跑
+                if let Err(_e) = process_transaction(client_ref, signature).await {
+                    // 生产环境下这里可以用 log crate 记录到文件
+                    // eprintln!("❌ Error: {}", e);
                 }
             });
         }
     });
 
-    // 3. 生产者：WebSocket 监听
+    // --- 前端生产者 ---
     println!("📡 连接 WebSocket...");
     let pubsub_client = PubsubClient::new(&ws_url).await?;
-    // 监听 System Program (SOL 转账)
     let filter = RpcTransactionLogsFilter::Mentions(vec!["11111111111111111111111111111111".to_string()]);
     let config = RpcTransactionLogsConfig {
         commitment: Some(CommitmentConfig::processed()),
     };
     let (mut stream, _unsub) = pubsub_client.logs_subscribe(filter, config).await?;
 
-    println!("🎧 监听中... (阈值: > 0.1 SOL)");
+    println!("🎧 监听中... (等待巨鲸出现)");
 
     while let Some(response) = stream.next().await {
         let logs = response.value;
-
-        // 🛠️ 修复 1：不要过滤 logs.len() <= 5
-        // 只过滤掉失败的交易 (err.is_some())
-        if logs.err.is_some() {
-            continue;
-        }
-
-        if let Err(_) = tx.send(logs.signature.clone()).await {
-            println!("后台已关闭");
-            break;
-        }
+        if logs.err.is_some() { continue; }
+        if let Err(_) = tx.send(logs.signature.clone()).await { break; }
     }
 
     Ok(())
 }
 
-// 接收 Arc<RpcClient>
 async fn process_transaction(client: Arc<RpcClient>, signature_str: String) -> anyhow::Result<()> {
     let signature = Signature::from_str(&signature_str)?;
-
-    // 使用 JsonParsed 格式
     let tx_detail = client.get_transaction(&signature, UiTransactionEncoding::JsonParsed).await;
 
-    match tx_detail {
-        Ok(tx) => {
-            if let Some(meta) = tx.transaction.meta {
-                // 确保数据完整
-                if meta.pre_balances.len() == 0 || meta.post_balances.len() == 0 {
-                    return Ok(());
-                }
+    if let Ok(tx) = tx_detail {
+        if let Some(meta) = tx.transaction.meta {
+            if meta.pre_balances.len() == 0 || meta.post_balances.len() == 0 { return Ok(()); }
 
-                let pre_bal = meta.pre_balances[0];
-                let post_bal = meta.post_balances[0];
+            let pre_bal = meta.pre_balances[0];
+            let post_bal = meta.post_balances[0];
+            let diff_lamports = (pre_bal as i64 - post_bal as i64).abs();
+            let sol_amount = diff_lamports as f64 / 1_000_000_000.0;
 
-                let diff_lamports = (pre_bal as i64 - post_bal as i64).abs();
-                let sol_amount = diff_lamports as f64 / 1_000_000_000.0;
+            // 为了测试，我们可以把阈值设低一点，比如 0.1 SOL
+            if sol_amount > 0.1 {
+                let msg = format!(
+                    "🐋 <b>巨鲸警报!</b>\n\n💰 <b>金额:</b> {:.2} SOL\n🔗 <a href=\"https://solscan.io/tx/{}\">查看交易详情</a>\n📉 余额变化: {:.2} -> {:.2}",
+                    sol_amount, signature_str, 
+                    pre_bal as f64 / 1e9, post_bal as f64 / 1e9
+                );
 
-                // 阈值测试：0.1 SOL
-                if sol_amount > 0.1 {
-                    println!("🐋 捕获! https://solscan.io/tx/{}", signature_str);
-                    println!("   💰 {:.4} SOL (Account0 变动)", sol_amount);
-                    println!("-------------------------------------------");
-                }
+                println!("--------\n{}\n--------", msg); // 终端也打印一份
+
+                // 🔥 发送报警 (Fire and forget: 不用等它发送成功，发出去就行)
+                // 这里我们不需要 .await? 阻塞当前函数，但因为我们需要它是异步的，
+                // 所以直接调用，让它在当前任务里跑完即可。
+                send_telegram_alert(msg).await;
             }
-        }
-        Err(e) => {
-            // 如果是 "Transaction X not found"，说明 RPC 还没同步完这笔刚发生的交易
-            // 在生产环境中，我们通常会在这里 sleep 500ms 然后重试一次
-            // 这里为了简单先忽略
-            // eprintln!("RPC 查询过早: {}", e);
         }
     }
     Ok(())
+}
+
+// --- 5. 新增：Telegram 报警模块 ---
+async fn send_telegram_alert(message: String) {
+    let token = match env::var("TELEGRAM_TOKEN") {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let chat_id = match env::var("TELEGRAM_CHAT_ID") {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+
+    // 打印调试信息：看看我们到底发了什么 ID
+    // println!("DEBUG: 正在发送给 Chat ID: '{}'", chat_id); 
+
+    let params = serde_json::json!({
+        "chat_id": chat_id, // 这里的 chat_id 如果包含空格或换行符会导致 400
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true
+    });
+
+    // 强制使用你设置的代理端口 (根据你之前的命令是 7897)
+    let proxy = reqwest::Proxy::all("http://127.0.0.1:7897").unwrap();
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    
+    match client.post(url).json(&params).send().await {
+        Ok(res) => {
+            if !res.status().is_success() {
+                eprintln!("⚠️ Telegram 发送失败: Status {}", res.status());
+                // 🔥 新增：打印具体的错误响应体，这能告诉我们到底是哪里错了
+                if let Ok(text) = res.text().await {
+                    eprintln!("❌ 错误原因: {}", text);
+                }
+            } else {
+                println!("✅ Telegram 报警发送成功!");
+            }
+        },
+        Err(e) => eprintln!("⚠️ Telegram 网络错误: {}", e),
+    }
 }
