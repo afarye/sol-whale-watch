@@ -1,0 +1,21 @@
+[package]
+name = "sol-whale-watcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# 1. 异步运行时霸主
+tokio = { version = "1.0", features = ["full"] }
+
+# 2. Solana 客户端库 (注意：这个库比较大，下载可能需要一点时间)
+solana-client = "1.18"
+solana-sdk = "1.18"
+
+# 3. 环境变量管理 (Web3 开发必背，用于存 API Key)
+dotenv = "0.15"
+
+# 4. 更好的错误处理 (行业标准)
+anyhow = "1.0"
+
+# 5. 异步编程的工具库
+futures = "0.3"
